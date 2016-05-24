@@ -1,0 +1,320 @@
+---
+title: 'Response to McDavid et al. '
+author: "Florian Buettner,  John C. Marioni and Oliver Stegle"
+output:
+  pdf_document:
+    fig_caption: yes
+    toc: yes
+  html_document:
+    fig_caption: yes
+    toc: yes
+    toc_depth: 2
+  word_document:
+    fig_caption: yes
+    toc: yes
+---
+
+```{r libraries, echo=TRUE, error=FALSE, cache=FALSE, echo=FALSE}
+knitr::opts_chunk$set(message=FALSE, error=FALSE, warning=FALSE, cache=TRUE, auto.dep=TRUE, echo=TRUE)
+suppressPackageStartupMessages({
+library(data.table)
+library(ggplot2)
+library(gdata)
+library(gplots)
+library(org.Mm.eg.db)
+library(limma)
+stopifnot(packageVersion('limma')>='3.22.5') #needed because function ids2indices was recently renamed
+library(GSEABase)
+library(Biobase)
+library(BASiCS)
+library(destiny)
+library(cowplot)
+library(topGO)
+library(scLVM)
+library(DESeq)
+})
+```
+
+## Loading the data
+We first follow McDavid et al. and load all the required data, including corrected and uncorrected T-cell expression data, the results of the clustering of the correced T-cell data and the cell-cycle genes. 
+
+
+```{r load_data}
+## Supplementary Data 1, sheet 1
+T_cell_raw <- fread("data/T_cell_uncorrected.csv")
+## sheet 2
+T_cell_corrected <- fread("data/T_cell_corrected.csv") 
+setnames(T_cell_raw, "V1", "cell_id")
+setnames(T_cell_corrected, "V1", "cell_id")
+## Supplementary Data 1, sheet 3
+cluster <- fread("data/T_cell_cluster.csv")
+setnames(cluster, 'Gata3HighCLuster', 'clusterid')
+cluster <- cluster[,clusterid:=factor(clusterid)]
+
+T_cell_matrix <- as.matrix(T_cell_raw[,-1,with=FALSE])
+T_cell_matrix_corrected <- as.matrix(T_cell_corrected[,-1,with=FALSE])
+# Remove duplicated gene names (only 2)
+T_cell_matrix <- T_cell_matrix[,unique(colnames(T_cell_matrix))]
+T_cell_matrix_corrected <- T_cell_matrix_corrected[,unique(colnames(T_cell_matrix_corrected))]
+geneID = colnames(T_cell_matrix_corrected)
+stopifnot(all(colnames(T_cell_matrix_corrected)==colnames(T_cell_matrix)))
+
+TcellCdat <- data.frame(cluster)
+
+```
+
+
+
+## Relationship between scLVM factor and different size factors
+In order to explore how well the inferred factor by scLVM tracks cell size and other features, we considered alternative approaches for estimating size factors. These include BASiCS, a Bayesian method which  infers separate size factors corresponding to cell size and technical variation as well as the standard DESeq size factors. 
+
+
+```{r cal_size_factors}
+#1. laod raw read counts
+data(data_Tcells)
+geneTypes <- factor( c( ENSM="ENSM", ERCC="ERCC" )[
+substr( rownames(dataMouse), 1, 4 ) ] )
+countsMmus <- dataMouse[ which( geneTypes=="ENSM" ), ]
+sym_names = getSymbols(row.names(countsMmus))
+countsERCC <- dataMouse[ which( geneTypes=="ERCC" ), ]
+
+#2. calculate DESeq size factors for counts
+sfERCC <- estimateSizeFactorsForMatrix( countsERCC )
+sfEndo = estimateSizeFactorsForMatrix( countsMmus )
+
+nCountsERCC <- t( t(countsERCC) / sfERCC )
+nCountsMmus <- t( t(countsMmus) / sfERCC ) 
+
+
+
+
+```
+
+
+Next, we use the raw data to fit a variety of size factors, as well the scLVM factor. First, let's fit the scLVM factor.
+
+```{r scLVM_factor}
+Y = t(log10(nCountsMmus+1)) #normalised transformed 
+sclvm = new("scLVM")
+sclvm = init(sclvm,Y=Y,tech_noise = NULL)
+
+#get cell cycle genes from GO 
+ens_ids_cc <- getEnsembl('GO:0007049')
+CellCycle = fitFactor(sclvm,geneSet = ens_ids_cc,k=1)
+
+#Get cell-cycle factor
+scLVM.CellCycle = CellCycle$X
+```
+
+We have already calculated the DESeq size facotrs, now we will compute the BASiCS size factors. As inference in BASiCS is done via MCMC, computation can take a long time. Fo rconvenience we have stored the results which were generated as follows. 
+
+```{r basics, results='hide'}
+
+ is_expressed = rowSums(countsMmus)>0
+ is_expressedERCC = rowSums(countsERCC)>0
+ 
+ Counts = as.matrix(rbind(countsMmus[is_expressed,],countsERCC[is_expressedERCC,]))
+ Tech = c(rep(FALSE,sum(is_expressed)),rep(TRUE,sum(is_expressedERCC)))
+ SpikeInput = (apply(countsERCC[is_expressedERCC,],1,mean))
+ 
+ Filter = BASiCS_Filter(Counts, Tech, SpikeInput, 
+                        MinTotalCountsPerCell = 2, MinTotalCountsPerGene = 2, 
+                        MinCellsWithExpression = 2, MinAvCountsPerCellsWithExpression = 2)
+ 
+ FilterData = newBASiCS_Data(Filter$Counts, Filter$Tech, Filter$SpikeInput)
+ 
+#not run 
+# MCMC_Output <- BASiCS_MCMC(FilterData, N = 20000, Thin = 10, Burn = 10000, StoreChains = T, 
+#                            StoreDir = getwd(), RunName = "Tcells")
+
+
+load('im_scBasics2708.rda')
+#load('../data/res_BASiCS.rda')
+
+MCMC_Summary <- Summary(MCMC_Output) 
+Basics.phi = MCMC_Summary@phi[,1] #designed to capture cell size 
+Basics.s = MCMC_Summary@s[,1] #designed to capture technical variation
+```
+
+Finally, we calculate standard library suze by summing up all read counts in a cell and look at the correlation between the various soze factors. This revealed that the scLVM factor is moderately correlated with cell size factors (max correlation R2 = 0.74 with BASiCS). 
+
+```{r}
+#library size
+libsize = apply((countsMmus),2,sum)
+libsizeERCC = apply((countsERCC),2,sum)
+
+
+#correlation between the size factors
+corMat = cor(cbind(sfEndo, sfERCC, libsize, libsizeERCC, scLVM.CellCycle, Basics.phi, Basics.s))
+```
+
+```{r fig1,fig.width=4,fig.height=4,include=TRUE,fig.cap="Correlation between scLVM facotr and various size factors"}
+heatmap.2(corMat^2, trace='none', margins=c(10,10))
+```
+
+###Remark on the analysis presented by McDavid et al. 
+The above observation is not surprising since cell size and cell cycle stage are clearly related. McDavid et al. used an unconventional approach to compute a “geometric size factor” that uses only a subset of genes and computes the size factor on the normalized log-scale. They observe that this geometric size factor is strongly correlated (R2=0.9) with the scLVM factor and therefore hypothesise that the scLVM factor captures information only relating to cell size. However, the much lower correlation of the scLVM factor with the independently computed normalization in BASiCS, which is explicitly designed to account for variation in cell size, as well as other size factors estimates in common usage, suggests that the scLVM factor does capture information that is independent of cell size.
+
+
+
+## Gene Set Enrichment Analysis using Corrected Data
+A concern of McDavid et al. is that our analytical strategy does not effectively remove variation due to the cell cycle in the T-cell data. Arguing against this interpretation, in our published manuscript we performed extensive analyses that demonstrated that the residual variability in the cell cycle corrected T-cell data is dominated by factors attributable to T-cell differentiation. 
+These observations are apparently contradicted by the results of the gene set enrichment analysis reported by McDavid et al., who found that the overwhelming majority of enriched modules were cell-cycle related processes. We believe this result can be explained by the analytical methods McDavid et al. applied. Rather than performing a standard GO enrichment that exploits a pre-defined set of differentially expressed genes, McDavid et al. used CAMERA, a competitive gene set test enrichment approach that penalizes inter-gene correlation. CAMERA was developed for microarray data where a high level of inter-gene correlation within the test set of genes (after controlling for the treatment effect) is potentially a confounding factor that can lead to type I errors. In other words, CAMERA assumes that, after correcting for between group mean effects, any correlation remaining between genes is not biologically relevant.
+
+However, in the context of the T-cell differentiation experiment, where the 81 cells were sampled from a differentiation trajectory, we expect that even after allocating cells into two groups, substantial inter-gene correlation within each group will remain and be biologically relevant. More precisely, the two groups we identify contain early and late differentiating cells. Within each of these groups, however, we still expect a gradient of cells: for example, in the “less differentiated group” we will still be able to rank cells along a developmental trajectory. 
+
+
+In order to illustrate this effect, we first compare the inter-gene correlation for genes annotated to moduels identified by us to those identified by McDavid et al. We follow McDavid et al. in using the Broad Institute's "Reactome" module and first run CAMERA.
+
+```{r camera}
+eSet <- ExpressionSet(t(T_cell_matrix_corrected))
+pData(eSet) <- TcellCdat
+
+c2_set <- getGmt("data/c2.cp.reactome.v4.0.symbols.gmt")
+gene_ids <- geneIds(c2_set)
+
+## # Camera requires gene-indices
+design <- model.matrix(~clusterid, eSet)
+sets_indices <- ids2indices(gene_ids, toupper(rownames(eSet))) 
+res <- camera(eSet, sets_indices, design=design, use.ranks = F, sort=F)
+resCAMERASorted = res[order(res[,5]),]
+resCAMERASorted$set <- row.names(resCAMERASorted)
+head(res[order(res[,5]),])
+```
+
+As reported by McDavid et al., a substantial number of the significant terms relate to cell cycle. We next have a more detailed look at the inter-gene correlation.
+
+```{r correlation_camera}
+nTop = 10 
+soCam = sort(res[,5], index.return=T)
+sets_filter = sets_indices[rownames(res)[soCam$ix[1:nTop]]]
+corr = unlist(lapply(sets_filter, function(x)mean(cor(T_cell_matrix_corrected[TcellCdat$clusterid==0,x]))))
+corrI = unlist(lapply(sets_filter, function(x)(interGeneCorrelation(y=t(T_cell_matrix_corrected[,x]), design=design)$correlation )))
+```
+
+```{r fig2,fig.width=4,fig.height=4,include=TRUE,fig.cap="Inter-gene Correlation CAMERA/McDavid et al."}
+
+ggplot()+geom_boxplot(mapping=aes(x='CAMERA/McDavid et al', y=corrI))+ylab("Inter-gene correlation")+xlab("")
+```
+
+If we look at the inter-gene correlation of the top 10 modules (after accounting for the clusters), we find - as expected - that it is very low, with a median of `r round(median(corrI),3)`. 
+Next, we compare this to the correlation within the modules we identified. 
+
+
+First retrieve the gene sets from topGO.
+```{r gene_sets_topgo, results='hide'}
+#load DE genes
+DEgenes = read.xls('~/Dropbox/SC_RNAseq_Cell_Cycle/Final Version/submission/supplementary files/Supplementary Table 4.xlsx', as.is=TRUE, header=F)$V1
+
+all_genes <- as.factor(as.integer(sym_names[is_expressed] %in% DEgenes))
+names(all_genes) <- sym_names[is_expressed]
+
+#retrieve annotation data froom GO
+tgd <- new( "topGOdata", ontology="BP", allGenes = as.factor(all_genes),nodeSize=5,
+            annot=annFUN.org, mapping="org.Mm.eg.db",ID='symbol')
+go <- usedGO(tgd)
+ann.genes = genesInTerm(tgd, go)
+#names(ann.genes) = Term(names(ann.genes))
+
+sets_indicesBNC <- ids2indices(ann.genes, (colnames(T_cell_matrix_corrected))) 
+#names(sets_indicesBNC) = Term(names(sets_indicesBNC))
+
+resultTopGO <- runTest(tgd, algorithm = "elim", statistic = "Fisher" )
+tab = GenTable( tgd, resultTopGO, topNodes=nTop ) 
+```
+
+Now we can compare the intergene correlation in the topGO modules.
+
+```{r topGO_correlations}
+sets_filterBNC = sets_indicesBNC[tab[,1]]
+corrBNC = unlist(lapply(sets_filterBNC, function(x)mean(cor(T_cell_matrix_corrected[TcellCdat$clusterid==0,x]))))
+corrIBNC = unlist(lapply(sets_filterBNC, function(x)(interGeneCorrelation(y=t(T_cell_matrix_corrected[,x]), design=design)$correlation )))
+
+dfCorr = data.frame(corr = c(corr, corrBNC),corrI = c(corrI, corrIBNC), label = c(rep("CAMERA",nTop), rep("topGO",nTop)))
+```
+
+```{r fig3,fig.width=8,fig.height=4,include=TRUE,fig.cap="Inter-gene correlation for CAMERA/McDavid et al. and topGP/Buettner et al."}
+
+ggplot(data=dfCorr) + geom_boxplot(mapping  = aes(y=corrI, x=label))+xlab("Gene sets")+ylab("Inter-gene correlation")
+
+
+```
+
+With a median of `r round(median(corrIBNC),3)`, the inter-gene correlation for the gene set identified by topGO was about 10 times higher than in those sets identified by CAMERA (again after controlling for the clusters). We also explore how many of the genes that were differntially expressed between the cluster, are present in the modules identified by topGO and CAMERA respectively. As CAMERA penalizes inter-gene correlations, also weak signatures such as remaining cell-cycle signals can appear to be enriched. We investigated an interaction effect between cell cycle and differntiation that could potentially explain this effect in our primary publication . Therefore, we also explore the number of these interaction genes present in the various sets. 
+
+```{r overlap_DE_Genes}
+int_genes <- read.xls('~/Dropbox/SC_RNAseq_Cell_Cycle/Final Version/submission/supplementary files/Supplementary Table 7.xlsx', as.is=TRUE, header=F)$V1
+
+
+numTop = c()
+numTerm = c()
+numTop_noInt = c()
+DE_in_Modules = c()
+in_Modules = c()
+
+topRank = length(DEgenes)+1
+for(j in 1:nTop){
+
+  
+idx_term = j
+
+idx_set = match(geneID[unlist(sets_indices[resCAMERASorted$set[idx_term]])],geneID)
+idx_setDE = match(geneID[unlist(sets_indices[resCAMERASorted$set[idx_term]])],DEgenes)
+
+
+
+idx_inter_set = idx_set[na.omit(match(as.character(int_genes),geneID[idx_set]))]
+
+num_highInter = length(intersect(as.character(int_genes),DEgenes[idx_setDE]))
+
+numTop[j] = length(na.omit(idx_setDE))
+numTerm[j] = length(na.omit(idx_set))
+numTop_noInt[j] = numTop[j]-num_highInter#sum(idx_inter_set<topRank)
+
+
+DE_in_Modules = c(DE_in_Modules,intersect(DEgenes, geneID[unlist(sets_indices[resCAMERASorted$set[idx_term]])]))
+
+
+}
+nDEinModules = length(unique(DE_in_Modules))
+df = data.frame(frac = c((numTop/numTerm)[1:nTop], (tab[,4]/tab[,3])[1:nTop]), label = c(rep("CAMERA",nTop), rep("topGO",nTop)))
+
+
+resBNC = cbind(numTerm,numTop,numTop_noInt)
+resBNC
+
+```
+This illustrates that only a small number of DE genes are annotated to the gene sets identified by McDavid et al. More specifically, in the top `r nTop` modules only `r nDEinModules` genes overlapped the annotated genes. When removing the interaction genes, this number decreased to `r nDEinModules-length(intersect(unique(DE_in_Modules),int_genes ))` genes. 
+
+```{r fig4,fig.width=8,fig.height=4,include=TRUE,fig.cap="Fraction of DE genes for CAMERA/McDavid et al. and topGP/Buettner et al."}
+
+ggplot(data=df) + geom_boxplot(mapping  = aes(y=frac, x=label))+xlab("Gene sets") +ylab("Fraction of DE genes") +  
+  geom_hline(aes(yintercept=rep(length(DEgenes)/length(geneID), 2*nTop)) ,linetype="dotted")
+
+```
+The dotted lines illustrates the number of DE genes expected by chance.
+
+
+## Remark on T-cell clustering
+McDavid et al. report they were unable to replicate the clustering for the corrected data using dimensionality reduction methods other than GPLVM. While GPLVM perfroms best on these data, we can also find a largely similar clustering using diffusion maps.  
+
+
+```{r diffusion_map}
+
+diffmap = DiffusionMap(T_cell_matrix_corrected)
+
+dDiffMap <- qplot(diffmap@eigenvectors[,1], diffmap@eigenvectors[,2], colour=TcellCdat$clusterid) + xlab("DC1") + ylab("DC2") +guides(colour=guide_legend(title="ClustersId"))
+```
+
+```{r fig5,fig.width=4,fig.height=4,include=TRUE,fig.cap="Diffusion Map"}
+
+dDiffMap
+
+```
+
+
+## Session Info
+This was generated using
+```{r}
+sessionInfo()
+```
