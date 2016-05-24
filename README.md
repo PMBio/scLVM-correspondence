@@ -1,2 +1,2 @@
 # scLVM-correspondence
-NBT correspondence on scLVM
+In this repository, we provide all the code required to reproduce the results we report in our reply to a Commentary by McDavid et al. on our paper "Computational analysis of cell-to-cell heterogeneity in single-cell RNA-sequencing data reveals hidden subpopulations of cells" . It consists of an Rmarkdown file, an accompanying pdf version of the executed code and the raw data.
